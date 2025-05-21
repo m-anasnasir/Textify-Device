@@ -6,13 +6,21 @@
 #include <driver/i2s.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
+#include <Wire.h>
+#include <U8g2lib.h>
 
+// Create display object for SH1106 I2C (ESP32)
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// I2S and SD Configurations
 #define SD_CS_PIN 5
 #define SAMPLE_RATE 48000
 #define SAMPLE_BUFFER_SIZE 512
 #define CHUNK_DURATION_MS 30000
 #define LED_PIN 2
+#define EXTERNAL_LED_PIN 4 // Define pin for external LED
 
+// Global Variables
 bool isIntroRecording = false;
 File introFile;
 uint32_t introBytesWritten = 0;
@@ -28,6 +36,14 @@ bool isRecording = false;
 bool stopRequested = false;
 unsigned long chunkStartTime = 0;
 String currentFilePath = "";
+
+// Upload status for display
+String lastUploadStatus = "N/A";
+
+// OLED display buffer
+#define MAX_LINES 5
+String displayBuffer[MAX_LINES];
+int lineCount = 0;
 
 struct WAVHeader {
   char riff[4];
@@ -70,57 +86,122 @@ static const i2s_pin_config_t i2s_mic_pins = {
 
 WebServer server(80);
 
+// Custom print function to mirror to OLED
+void customPrint(const String &message) {
+  Serial.println(message); // Print to Serial Monitor
+
+  // Add message to display buffer
+  if (lineCount < MAX_LINES) {
+    displayBuffer[lineCount] = message;
+    lineCount++;
+  } else {
+    // Shift lines up and add new message at the bottom
+    for (int i = 0; i < MAX_LINES - 1; i++) {
+      displayBuffer[i] = displayBuffer[i + 1];
+    }
+    displayBuffer[MAX_LINES - 1] = message;
+  }
+
+  // Update OLED display
+  u8g2.clearBuffer();
+  for (int i = 0; i < lineCount && i < MAX_LINES; i++) {
+    u8g2.drawStr(0, i * 12, displayBuffer[i].c_str()); // 12 pixels per line
+  }
+  u8g2.sendBuffer();
+}
+
+// ===== Upload Task Function =====
 void uploadTask(void* parameter) {
   String filePath = *((String*)parameter);
   delete (String*)parameter;
 
   String filename = filePath;
   if (filename.startsWith("/")) filename = filename.substring(1);
-  String requestURL = "http://192.168.1.172:3000/api/v1/presigned-url?filename=" + filename;
+  String requestURL = "http://192.168.1.119:3000/api/v1/presigned-url?filename=" + filename;
 
   HTTPClient http;
-  http.begin(requestURL);
+  http.setTimeout(10000);
+  if (!http.begin(requestURL)) {
+    customPrint("❌ Failed to initialize HTTP connection for presigned URL.");
+    lastUploadStatus = "HTTP Error";
+    vTaskDelete(NULL);
+    return;
+  }
+
   int httpCode = http.GET();
   if (httpCode == 200) {
     String payload = http.getString();
     StaticJsonDocument<512> doc;
-    if (deserializeJson(doc, payload) == DeserializationError::Ok && doc.containsKey("url")) {
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error == DeserializationError::Ok && doc.containsKey("url")) {
       String presignedUrl = doc["url"].as<String>();
-      File file = SD.open("/" + filename);
+      if (presignedUrl.length() == 0) {
+        customPrint("❌ Empty presigned URL");
+        lastUploadStatus = "HTTP Error";
+        http.end();
+        vTaskDelete(NULL);
+        return;
+      }
+
+      File file = SD.open(filePath);
       if (file) {
         HTTPClient putClient;
-        putClient.begin(presignedUrl);
+        putClient.setTimeout(15000);
+        if (!putClient.begin(presignedUrl)) {
+          customPrint("❌ Failed to initialize HTTP connection for upload.");
+          lastUploadStatus = "HTTP Error";
+          file.close();
+          http.end();
+          vTaskDelete(NULL);
+          return;
+        }
+
         putClient.addHeader("Content-Type", "audio/wav");
         int code = putClient.sendRequest("PUT", &file, file.size());
-        Serial.printf("\n📤 Upload %s -> HTTP %d\n", filename.c_str(), code);
+        customPrint("📤 Upload " + filename + " -> HTTP " + String(code));
+        if (code > 0 && (code == HTTP_CODE_OK || code == HTTP_CODE_CREATED)) {
+          lastUploadStatus = "Upload Successfully";
+        } else {
+          customPrint("❌ Upload failed with HTTP " + String(code));
+          lastUploadStatus = "HTTP Error";
+        }
         putClient.end();
         file.close();
+      } else {
+        customPrint("❌ Failed to open file for upload.");
+        lastUploadStatus = "HTTP Error";
       }
+    } else {
+      customPrint("❌ JSON parse failed or 'url' missing.");
+      lastUploadStatus = "HTTP Error";
     }
   } else {
-    Serial.printf("\n❌ Failed to get presigned URL. HTTP %d\n", httpCode);
+    customPrint("❌ Failed to get presigned URL. HTTP " + String(httpCode));
+    lastUploadStatus = "HTTP Error";
   }
   http.end();
   vTaskDelete(NULL);
 }
 
+// ===== Wi-Fi Setup =====
 void connectWiFi() {
   WiFiManager wifiManager;
   wifiManager.resetSettings();
   wifiManager.setTimeout(180);
   delay(1000);
 
-  Serial.println("Starting WiFi configuration AP...");
+  customPrint("Starting WiFi configuration AP...");
   if (!wifiManager.startConfigPortal("Textify")) {
-    Serial.println("Failed to start configuration portal and hit timeout");
+    customPrint("Failed to start configuration portal and hit timeout");
     ESP.restart();
   }
   digitalWrite(LED_PIN, HIGH);
-  Serial.println("Connected to WiFi!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  digitalWrite(EXTERNAL_LED_PIN, HIGH); // Turn on external LED when Wi-Fi connects
+  customPrint("Connected to WiFi!");
+  customPrint("IP Address: " + WiFi.localIP().toString());
 }
 
+// ===== WAV File Header Functions =====
 void writeWAVHeaderPlaceholder(File &file) {
   memcpy(header.riff, "RIFF", 4);
   header.fileSize = 0;
@@ -148,73 +229,98 @@ void updateWAVHeader(File &file, uint32_t totalAudioBytes) {
   file.seek(0, SeekEnd);
 }
 
+// ===== Intro Recording Functions =====
 void startIntroRecording() {
   currentIntroFilePath = "/intro/intro" + String(introCount) + ".wav";
   introFile = SD.open(currentIntroFilePath, FILE_WRITE);
   if (!introFile) {
-    Serial.println("❌ Failed to open intro file for recording");
+    customPrint("❌ Failed to open intro file for recording");
     return;
   }
   writeWAVHeaderPlaceholder(introFile);
   introBytesWritten = 0;
   introStartTime = millis();
   isIntroRecording = true;
-  Serial.print("🎙 Intro recording started: ");
-  Serial.println(currentIntroFilePath);
+  customPrint("🎙 Intro recording started: " + currentIntroFilePath);
 }
 
 void stopIntroRecording() {
-  if (!isIntroRecording) return;
+  if (!isIntroRecording) {
+    customPrint("❌ No intro recording in progress");
+    return;
+  }
 
   updateWAVHeader(introFile, introBytesWritten);
   introFile.close();
   isIntroRecording = false;
+  customPrint("📁 Intro recording stopped");
 
-  String filename = "intro/intro" + String(introCount) + ".wav";
-  String* path = new String("/" + filename);
-  xTaskCreatePinnedToCore(uploadTask, "UploadTask", 8192, path, 1, NULL, 0);
+  String* path = new String(currentIntroFilePath);
+  xTaskCreatePinnedToCore(uploadTask, "IntroUploadTask", 10000, path, 1, NULL, 0);
   introCount++;
 }
 
+// ===== Meeting Recording Functions =====
 void startRecording() {
   currentFilePath = "/meetings/meeting" + String(meetingCount) + ".wav";
   audioFile = SD.open(currentFilePath, FILE_WRITE);
   if (!audioFile) {
-    Serial.println("❌ Failed to open file for recording");
+    customPrint("❌ Failed to open file for recording");
     return;
   }
   writeWAVHeaderPlaceholder(audioFile);
   totalBytesWritten = 0;
   chunkStartTime = millis();
   isRecording = true;
-  Serial.print("🎙 Recording started: ");
-  Serial.println(currentFilePath);
+  customPrint("🎙 Recording started: " + currentFilePath);
 }
 
 void stopRecording() {
-  if (!isRecording) return;
+  if (!isRecording) {
+    customPrint("❌ Not recording");
+    return;
+  }
 
   updateWAVHeader(audioFile, totalBytesWritten);
   audioFile.close();
   isRecording = false;
+  customPrint("📁 Recording stopped");
 
-  String filename = "meetings/meeting" + String(meetingCount) + ".wav";
-  String* path = new String("/" + filename);
-  xTaskCreatePinnedToCore(uploadTask, "UploadTask", 8192, path, 1, NULL, 0);
+  String* path = new String(currentFilePath);
+  xTaskCreatePinnedToCore(uploadTask, "UploadTask", 10000, path, 1, NULL, 0);
   meetingCount++;
+  
+  if (!stopRequested) {
+    startRecording();
+  } else {
+    stopRequested = false;
+    customPrint("🛑 Recording stopped after final chunk.");
+  }
 }
 
+// ===== Setup =====
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  pinMode(EXTERNAL_LED_PIN, OUTPUT); // Initialize external LED pin
+  digitalWrite(EXTERNAL_LED_PIN, LOW); // Turn off external LED initially
+
+  // Initialize display first
+  Wire.begin(21, 22); // Explicitly initialize I2C with SDA and SCL pins
+  u8g2.begin();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.setContrast(128);
+
+  customPrint("Initializing...");
 
   if (!SD.begin(SD_CS_PIN)) {
-    Serial.println("❌ SD card initialization failed!");
+    customPrint("❌ SD card initialization failed!");
     while (true) delay(100);
   }
+  customPrint("✅ SD card initialized");
 
   if (!SD.exists("/intro")) SD.mkdir("/intro");
   if (!SD.exists("/meetings")) SD.mkdir("/meetings");
@@ -223,6 +329,7 @@ void setup() {
 
   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
+  customPrint("✅ I2S initialized");
 
   server.on("/", HTTP_GET, []() {
     server.send(200, "text/plain", "ESP32 Audio Recorder API");
@@ -248,9 +355,16 @@ void setup() {
   });
 
   server.on("/status", HTTP_GET, []() {
-    String status = isRecording ? "recording" : "stopped";
-    String response = "{\"status\":\"" + status + "\",\"meetingCount\":" + String(meetingCount) + "}";
-    server.send(200, "application/json", response);
+    String status = isRecording ? "recording" : (isIntroRecording ? "intro recording" : "stopped");
+    String wifiStatus = WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected";
+    String sdStatus = SD.begin(SD_CS_PIN) ? "Initialized" : "Not Initialized";
+    String response = "<h1>ESP32 Audio Recorder Status</h1>"
+                     "<p>Wi-Fi Status: " + wifiStatus + " (IP: " + WiFi.localIP().toString() + ")</p>"
+                     "<p>SD Card Status: " + sdStatus + "</p>"
+                     "<p>Recording Status: " + status + "</p>"
+                     "<p>Meeting Count: " + String(meetingCount) + "</p>"
+                     "<p>Last Upload Status: " + lastUploadStatus + "</p>";
+    server.send(200, "text/html", response);
   });
 
   server.on("/start-intro", HTTP_GET, []() {
@@ -272,10 +386,13 @@ void setup() {
   });
 
   server.begin();
+  customPrint("HTTP server started");
 }
 
+// ===== Loop =====
 void loop() {
   server.handleClient();
+
   // Handle serial commands
   if (Serial.available()) {
     char cmd = Serial.read();
@@ -292,7 +409,7 @@ void loop() {
         break;
       case 'r':
         meetingCount = 1;
-        Serial.println("✅ Meeting count reset to 1");
+        customPrint("✅ Meeting count reset to 1");
         break;
     }
   }
@@ -307,12 +424,6 @@ void loop() {
 
     if (millis() - chunkStartTime >= CHUNK_DURATION_MS) {
       stopRecording();
-      if (!stopRequested) {
-        startRecording();
-      } else {
-        stopRequested = false;
-        Serial.println("🛑 Recording stopped after final chunk.");
-      }
     }
   }
 
@@ -326,5 +437,7 @@ void loop() {
   }
 
   digitalWrite(LED_PIN, WiFi.status() == WL_CONNECTED ? HIGH : LOW);
+  digitalWrite(EXTERNAL_LED_PIN, WiFi.status() == WL_CONNECTED ? HIGH : LOW); // Sync external LED with Wi-Fi status
+
   delay(1);
 }
