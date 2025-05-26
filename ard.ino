@@ -8,9 +8,9 @@
 #include <WiFiManager.h>
 
 #define SD_CS_PIN 5
-#define SAMPLE_RATE 48000
+#define SAMPLE_RATE 16000
 #define SAMPLE_BUFFER_SIZE 512
-#define CHUNK_DURATION_MS 30000
+#define CHUNK_DURATION_MS 10000
 #define LED_PIN 2
 
 // FreeRTOS task stack sizes
@@ -138,37 +138,90 @@ void uploadTask(void *parameter) {
 
   String filename = filePath;
   if (filename.startsWith("/")) filename.remove(0, 1);
-  String requestURL = String("https://3125ccb2-54a5-4d27-9aef-532ef1bdaccc-00-226tm68i8l9bh.sisko.replit.dev/api/v1/presigned-url?filename=") + filename;
+  String requestURL = String("http://192.168.1.172:3000/api/v1/presigned-url?filename=") + filename;
+
+  Serial.print("Request URL: ");
+  Serial.println(requestURL);
 
   HTTPClient http;
-  http.begin(requestURL);
-  int httpCode = http.GET();
-  if (httpCode == 200) {
-    String payload = http.getString();
-    StaticJsonDocument<512> doc;
-    if (deserializeJson(doc, payload) == DeserializationError::Ok && doc.containsKey("url")) {
-      String presignedUrl = doc["url"].as<String>();
-      File file = SD.open("/" + filename, FILE_READ);
-      if (file) {
-        HTTPClient putClient;
-        putClient.begin(presignedUrl);
-        putClient.addHeader("Content-Type", "audio/wav");
-        int code = putClient.sendRequest("PUT", (Stream *)&file, file.size());
-        Serial.printf("\n📤 Uploaded %s -> HTTP %d\n", filename.c_str(), code);
-        putClient.end();
-        file.close();
+  http.setTimeout(20000);  // Set timeout to 20 seconds for GET request
+
+  int retries = 3;  // Number of retry attempts
+  int httpCode = 0;
+  String presignedUrl = "";
+
+  // Attempt to get the presigned URL with retries
+  while (retries > 0) {
+    http.begin(requestURL);  // HTTP request
+    httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      StaticJsonDocument<512> doc;
+      if (deserializeJson(doc, payload) == DeserializationError::Ok && doc.containsKey("url")) {
+        presignedUrl = doc["url"].as<String>();
+        Serial.println("Presigned URL received: ");
+        Serial.println(presignedUrl);
+        break;  // Successfully received the presigned URL, exit retry loop
       } else {
-        Serial.printf("\n❌ Couldn't open %s for upload\n", filename.c_str());
+        Serial.println("\n❌ Invalid JSON in presigned response");
       }
     } else {
-      Serial.println("\n❌ Invalid JSON in presigned response");
+      Serial.printf("\n❌ Presigned URL request failed: HTTP %d\n", httpCode);
     }
-  } else {
-    Serial.printf("\n❌ Presigned URL request failed: HTTP %d\n", httpCode);
+
+    retries--;
+    if (retries > 0) {
+      Serial.println("Retrying...");
+      vTaskDelay(pdMS_TO_TICKS(1000));  // Wait before retrying (1 second delay)
+    }
   }
+
+  if (presignedUrl == "") {
+    Serial.println("❌ Failed to get presigned URL after retries.");
+    http.end();
+    vTaskDelete(NULL);  // End the task if the URL could not be obtained
+    return;
+  }
+
+  // Now upload the file with the presigned URL
+  File file = SD.open("/" + filename, FILE_READ);
+  if (file) {
+    HTTPClient putClient;
+    putClient.begin(presignedUrl);
+    putClient.addHeader("Content-Type", "audio/wav");
+
+    int uploadRetries = 3;  // Retry count for upload
+    int uploadSuccess = false;
+
+    while (uploadRetries > 0 && !uploadSuccess) {
+      int code = putClient.sendRequest("PUT", (Stream *)&file, file.size());
+      if (code == 200) {
+        uploadSuccess = true;
+        Serial.printf("\n📤 Successfully uploaded %s -> HTTP %d\n", filename.c_str(), code);
+      } else {
+        Serial.printf("\n❌ Upload failed for %s -> HTTP %d\n", filename.c_str(), code);
+        uploadRetries--;
+        if (uploadRetries > 0) {
+          Serial.println("Retrying upload...");
+          vTaskDelay(pdMS_TO_TICKS(2000));  // Wait before retrying upload (2 seconds)
+        }
+      }
+    }
+
+    if (!uploadSuccess) {
+      Serial.println("❌ Upload failed after multiple attempts.");
+    }
+
+    putClient.end();
+    file.close();
+  } else {
+    Serial.printf("\n❌ Couldn't open %s for upload\n", filename.c_str());
+  }
+
   http.end();
-  vTaskDelete(NULL);
+  vTaskDelete(NULL);  // End the task when done
 }
+
 
 void connectWiFi() {
   WiFiManager wm;
