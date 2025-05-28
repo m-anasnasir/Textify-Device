@@ -20,7 +20,11 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 // LED Pins
 #define BUILT_IN_LED_PIN 2  // Built-in blue LED (active-high)
-#define EXT_LED_PIN 4      // External LED (active-high)
+#define EXT_LED_PIN 4       // External LED (active-high)
+
+// OLED Display Configuration
+#define MAX_LINES 3  // Reduced to 3 message lines to fit larger font (plus 1 header line)
+#define MAX_CHARS_PER_LINE 18  // 128 pixels / 7 pixels per char ≈ 18 chars
 
 // Global Variables
 bool isIntroRecording = false;
@@ -40,8 +44,7 @@ bool stopRequested = false;
 unsigned long chunkStartTime = 0;
 String currentFilePath = "";
 
-// OLED display buffer
-#define MAX_LINES 5
+// OLED display buffer for messages
 String displayBuffer[MAX_LINES];
 int lineCount = 0;
 
@@ -103,20 +106,42 @@ void customPrint(const String &message) {
 
   Serial.println(message);
 
+  // Truncate message to fit display width
+  String displayMessage = message;
+  if (displayMessage.length() > MAX_CHARS_PER_LINE) {
+    displayMessage = displayMessage.substring(0, MAX_CHARS_PER_LINE - 3) + "...";
+  }
+
+  // Update the display buffer (scrolling mechanism)
   if (lineCount < MAX_LINES) {
-    displayBuffer[lineCount] = message;
+    displayBuffer[lineCount] = displayMessage;
     lineCount++;
   } else {
     for (int i = 0; i < MAX_LINES - 1; i++) {
       displayBuffer[i] = displayBuffer[i + 1];
     }
-    displayBuffer[MAX_LINES - 1] = message;
+    displayBuffer[MAX_LINES - 1] = displayMessage;
   }
 
+  // Clear the display buffer
   u8g2.clearBuffer();
-  for (int i = 0; i < lineCount && i < MAX_LINES; i++) {
-    u8g2.drawStr(0, i * 12, displayBuffer[i].c_str());
+
+  // Draw the header (Wi-Fi status)
+  String wifiStatus = (WiFi.status() == WL_CONNECTED) ? "WiFi: Connected" : "WiFi: Disconnected";
+  if (wifiStatus.length() > MAX_CHARS_PER_LINE) {
+    wifiStatus = wifiStatus.substring(0, MAX_CHARS_PER_LINE - 3) + "...";
   }
+  u8g2.drawStr(2, 14, wifiStatus.c_str()); // Header at y=14 (first line)
+
+  // Draw a separator line below the header
+  u8g2.drawHLine(0, 16, 128);
+
+  // Draw the message lines (starting below the header)
+  for (int i = 0; i < lineCount && i < MAX_LINES; i++) {
+    u8g2.drawStr(2, 30 + i * 14, displayBuffer[i].c_str()); // Messages at y=30, 44, 58
+  }
+
+  // Update the display
   u8g2.sendBuffer();
 }
 
@@ -134,13 +159,12 @@ void connectWiFi() {
 
   WiFiManager wifiManager;
   wifiManager.setTimeout(180);
-  wifiManager.setDebugOutput(true); // Enable detailed debug output
+  wifiManager.setDebugOutput(true);
   wifiManager.setAPCallback([](WiFiManager *myWiFiManager) {
     customPrint("Entered config mode");
     customPrint("Connect to AP: " + String(myWiFiManager->getConfigPortalSSID()));
     customPrint("IP: 192.168.4.1");
-    digitalWrite(BUILT_IN_LED_PIN, LOW); // Turn off built-in LED (active-high)
-    digitalWrite(EXT_LED_PIN, LOW);      // Turn off external LED (active-high)
+    digitalWrite(EXT_LED_PIN, LOW); // Use only external LED
   });
 
   customPrint("Starting WiFiManager autoConnect...");
@@ -148,15 +172,13 @@ void connectWiFi() {
     customPrint("❌ Failed to connect to WiFi and hit timeout");
     WiFi.mode(WIFI_OFF);
     customPrint("WiFi disabled due to failure");
-    digitalWrite(BUILT_IN_LED_PIN, LOW); // Turn off built-in LED (active-high)
-    digitalWrite(EXT_LED_PIN, LOW);      // Turn off external LED (active-high)
+    digitalWrite(EXT_LED_PIN, LOW); // Use only external LED
     return;
   }
 
   customPrint("✅ Connected to WiFi");
   customPrint("IP Address: " + WiFi.localIP().toString());
-  digitalWrite(BUILT_IN_LED_PIN, HIGH); // Turn on built-in LED (active-high)
-  digitalWrite(EXT_LED_PIN, HIGH);      // Turn on external LED (active-high)
+  digitalWrite(EXT_LED_PIN, HIGH); // Use only external LED
 }
 
 // ===== WAV File Header Functions =====
@@ -193,7 +215,7 @@ void startIntroRecording() {
 
   introFile = SD.open(currentIntroFilePath, FILE_WRITE);
   if (!introFile) {
-    customPrint("❌ Failed to open intro file for recording");
+    customPrint("Failed to open intro file");
     return;
   }
 
@@ -201,23 +223,24 @@ void startIntroRecording() {
   introBytesWritten = 0;
   introStartTime = millis();
   isIntroRecording = true;
-  customPrint("🎙 Intro recording started: " + currentIntroFilePath);
+  customPrint("Intro recording started");
 }
 
+// Modified stopIntroRecording function
 void stopIntroRecording() {
   if (!isIntroRecording) {
-    customPrint("❌ No intro recording in progress");
+    customPrint("No intro recording");
     return;
   }
 
   updateWAVHeader(introFile, introBytesWritten);
   introFile.close();
   isIntroRecording = false;
-  customPrint("📁 Intro recording stopped");
+  customPrint("Intro recording stopped");
 
   // Skip upload if WiFi is not connected
   if (WiFi.status() != WL_CONNECTED) {
-    customPrint("❌ WiFi not connected, skipping intro upload");
+    customPrint("WiFi not connected");
     digitalWrite(BUILT_IN_LED_PIN, LOW); // Turn off built-in LED (active-high)
     digitalWrite(EXT_LED_PIN, LOW);      // Turn off external LED (active-high)
     introCount++;
@@ -232,10 +255,11 @@ void stopIntroRecording() {
   int httpCode = http.GET();
 
   if (httpCode != 200) {
-    customPrint("❌ Failed to get pre-signed URL for intro. HTTP Code: " + String(httpCode));
+    customPrint("Failed to get URL");
+    customPrint("HTTP Code: " + String(httpCode));
     if (httpCode > 0) {
       String payload = http.getString();
-      customPrint("Server Response: " + payload);
+      customPrint("Response: " + payload);
     }
     http.end();
     return;
@@ -247,18 +271,18 @@ void stopIntroRecording() {
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, payload);
   if (error) {
-    customPrint(String("❌ JSON parse failed for intro: ") + error.c_str());
+    customPrint("JSON parse failed");
     return;
   }
 
   if (!doc.containsKey("url")) {
-    customPrint("❌ 'url' field missing in intro response");
+    customPrint("URL field missing");
     return;
   }
 
   String presignedUrl = doc["url"].as<String>();
   if (presignedUrl.length() == 0) {
-    customPrint("❌ Empty intro presigned URL");
+    customPrint("Empty presigned URL");
     return;
   }
 
@@ -270,7 +294,7 @@ void stopIntroRecording() {
 void uploadToS3(String filePath, String presignedURL) {
   File file = SD.open(filePath);
   if (!file) {
-    customPrint("❌ Failed to open file for upload: " + filePath);
+    customPrint("Failed to open file");
     return;
   }
 
@@ -279,7 +303,7 @@ void uploadToS3(String filePath, String presignedURL) {
   http.addHeader("Content-Type", "audio/wav");
 
   int response = http.sendRequest("PUT", &file, file.size());
-  customPrint("📤 Upload HTTP Code: " + String(response));
+  customPrint("Upload HTTP Code: " + String(response));
 
   http.end();
   file.close();
@@ -287,7 +311,7 @@ void uploadToS3(String filePath, String presignedURL) {
 
 void startRecording() {
   if (MeetingId.length() == 0) {
-    customPrint("❌ Cannot start recording - MeetingId not set!");
+    customPrint("MeetingId not set!");
     return;
   }
 
@@ -295,9 +319,9 @@ void startRecording() {
 
   if (!SD.exists(folderPath)) {
     if (SD.mkdir(folderPath)) {
-      customPrint("📂 Created folder: " + folderPath);
+      customPrint("Created folder");
     } else {
-      customPrint("❌ Failed to create folder: " + folderPath);
+      customPrint("Failed to create folder");
       return;
     }
   }
@@ -306,7 +330,7 @@ void startRecording() {
 
   audioFile = SD.open(currentFilePath, FILE_WRITE);
   if (!audioFile) {
-    customPrint("❌ Failed to open file for recording: " + currentFilePath);
+    customPrint("Failed to open file");
     return;
   }
 
@@ -314,23 +338,24 @@ void startRecording() {
   totalBytesWritten = 0;
   chunkStartTime = millis();
   isRecording = true;
-  customPrint("🎙 Recording started: " + currentFilePath);
+  customPrint("Recording started");
 }
 
+// Modified stopRecording function
 void stopRecording() {
   if (!isRecording) {
-    customPrint("❌ Not recording");
+    customPrint("Not recording");
     return;
   }
 
   updateWAVHeader(audioFile, totalBytesWritten);
   audioFile.close();
   isRecording = false;
-  customPrint("📁 Recording stopped");
+  customPrint("Recording stopped");
 
   // Skip upload if WiFi is not connected
   if (WiFi.status() != WL_CONNECTED) {
-    customPrint("❌ WiFi not connected, skipping upload");
+    customPrint("WiFi not connected");
     digitalWrite(BUILT_IN_LED_PIN, LOW); // Turn off built-in LED (active-high)
     digitalWrite(EXT_LED_PIN, LOW);      // Turn off external LED (active-high)
     meetingCount++;
@@ -339,26 +364,27 @@ void stopRecording() {
 
   String filename = MeetingId + "/audio/" + "meeting" + String(meetingCount) + ".wav";
   String requestURL = "https://3125ccb2-54a5-4d27-9aef-532ef1bdaccc-00-226tm68i8l9bh.sisko.replit.dev/api/v1/presigned-url?filename=" + filename;
-  customPrint("Opening file at path: " + currentFilePath);
+  customPrint("Opening file");
 
   File testFile = SD.open(currentFilePath);
   if (!testFile) {
-    customPrint("❌ Test open failed! File does not exist or cannot be opened.");
+    customPrint("Test open failed!");
   } else {
-    customPrint("✅ Test open succeeded.");
+    customPrint("Test open succeeded");
     testFile.close();
   }
-  customPrint("Uploading file with filename: " + filename);
+  customPrint("Uploading file");
 
   HTTPClient http;
   http.begin(requestURL);
   int httpCode = http.GET();
 
   if (httpCode != 200) {
-    customPrint("❌ Failed to get pre-signed URL. HTTP Code: " + String(httpCode));
+    customPrint("Failed to get URL");
+    customPrint("HTTP Code: " + String(httpCode));
     if (httpCode > 0) {
       String payload = http.getString();
-      customPrint("Server Response: " + payload);
+      customPrint("Response: " + payload);
     }
     http.end();
     return;
@@ -370,18 +396,18 @@ void stopRecording() {
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, payload);
   if (error) {
-    customPrint(String("❌ JSON parse failed: ") + error.c_str());
+    customPrint("JSON parse failed");
     return;
   }
 
   if (!doc.containsKey("url")) {
-    customPrint("❌ 'url' field missing in response");
+    customPrint("URL field missing");
     return;
   }
 
   String presignedUrl = doc["url"].as<String>();
   if (presignedUrl.length() == 0) {
-    customPrint("❌ Empty presigned URL");
+    customPrint("Empty presigned URL");
     return;
   }
   String localFilePath = "/" + filename;
@@ -403,27 +429,27 @@ void setup() {
   // Initialize OLED
   Wire.begin(21, 22);
   u8g2.begin();
-  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.setFont(u8g2_font_7x14_tf); // Larger font for better readability
   u8g2.setContrast(128);
 
   customPrint("Initializing...");
 
   if (!SD.begin(SD_CS_PIN)) {
-    customPrint("❌ SD card initialization failed!");
+    customPrint("SD card init failed!");
     while (true) delay(100);
   }
-  customPrint("✅ SD card initialized");
+  customPrint("SD card initialized");
   if (!SD.exists("/intro")) {
     SD.mkdir("/intro");
-    customPrint("📂 '/intro' folder created");
+    customPrint("'/intro' created");
   } else {
-    customPrint("📂 '/intro' folder already exists");
+    customPrint("'/intro' exists");
   }
   if (!SD.exists("/audio")) {
     SD.mkdir("/audio");
-    customPrint("📂 '/audio' folder created");
+    customPrint("'/audio' created");
   } else {
-    customPrint("📂 '/audio' folder already exists");
+    customPrint("'/audio' exists");
   }
 
   // Check GPIO 2 state (only if not used for built-in LED)
@@ -437,14 +463,14 @@ void setup() {
 
   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
-  customPrint("✅ I2S initialized");
+  customPrint("I2S initialized");
 
   // Only start the server if WiFi is connected
   if (WiFi.status() == WL_CONNECTED) {
     server.begin();
     customPrint("HTTP server started");
   } else {
-    customPrint("HTTP server not started (no WiFi)");
+    customPrint("HTTP server not started");
   }
 }
 
@@ -474,7 +500,7 @@ void loop() {
         break;
       case 'r':
         meetingCount = 1;
-        customPrint("✅ Meeting count reset to 1");
+        customPrint("Meeting count reset");
         break;
     }
   }
@@ -488,7 +514,7 @@ void loop() {
     }
 
     if (millis() - chunkStartTime >= CHUNK_DURATION_MS) {
-      customPrint("Chunk duration reached, stopping recording...");
+      customPrint("Chunk duration reached");
       stopRecording();
       delay(2000);
       if (!stopRequested) {
@@ -496,7 +522,7 @@ void loop() {
         startRecording();
       } else {
         stopRequested = false;
-        customPrint("🛑 Recording stopped after final chunk.");
+        customPrint("Recording stopped");
       }
     }
   }
