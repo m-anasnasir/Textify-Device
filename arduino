@@ -11,12 +11,15 @@
 
 // Create display object for SH1106 I2C (ESP32)
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+const char *cloudServer = "https://3125ccb2-54a5-4d27-9aef-532ef1bdaccc-00-226tm68i8l9bh.sisko.replit.dev/api/v1";  // Replace with your cloud server URL
+unsigned long lastCommandPollTime = 0;
+const unsigned long commandPollInterval = 5000;  // 5 seconds
 
 // I2S and SD Configurations
 #define SD_CS_PIN 5
 #define SAMPLE_RATE 48000
 #define SAMPLE_BUFFER_SIZE 512
-#define CHUNK_DURATION_MS 10000  // 10 seconds
+#define CHUNK_DURATION_MS 30000  // 30 seconds
 
 // Global Variables
 bool isIntroRecording = false;
@@ -44,7 +47,7 @@ int lineCount = 0;
 
 // Rate limiting for customPrint
 unsigned long lastPrintTime = 0;
-const unsigned long printInterval = 500; // Minimum 500ms between prints
+const unsigned long printInterval = 500;  // Minimum 500ms between prints
 
 // WAV Header structure definition
 struct WAVHeader {
@@ -94,7 +97,7 @@ WebServer server(80);
 void customPrint(const String &message) {
   unsigned long currentTime = millis();
   if (currentTime - lastPrintTime < printInterval) {
-    return; // Skip printing if too soon
+    return;  // Skip printing if too soon
   }
   lastPrintTime = currentTime;
 
@@ -125,14 +128,14 @@ void customPrint(const String &message) {
   if (wifiStatus.length() > MAX_CHARS_PER_LINE) {
     wifiStatus = wifiStatus.substring(0, MAX_CHARS_PER_LINE - 3) + "...";
   }
-  u8g2.drawStr(2, 12, wifiStatus.c_str()); // Header at y=12 (first line)
+  u8g2.drawStr(2, 12, wifiStatus.c_str());  // Header at y=12 (first line)
 
   // Draw a separator line below the header
   u8g2.drawHLine(0, 14, 128);
 
   // Draw the message lines (starting below the header)
   for (int i = 0; i < lineCount && i < MAX_LINES; i++) {
-    u8g2.drawStr(2, 26 + i * 10, displayBuffer[i].c_str()); // Messages at y=26, 36, 46, 56, 66
+    u8g2.drawStr(2, 26 + i * 10, displayBuffer[i].c_str());  // Messages at y=26, 36, 46, 56, 66
   }
 
   u8g2.sendBuffer();
@@ -152,7 +155,7 @@ void connectWiFi() {
 
   WiFiManager wifiManager;
   wifiManager.setTimeout(180);
-  wifiManager.setDebugOutput(true); // Enable detailed debug output
+  wifiManager.setDebugOutput(true);  // Enable detailed debug output
   wifiManager.setAPCallback([](WiFiManager *myWiFiManager) {
     customPrint("Entered config mode");
     customPrint("Connect to AP: " + String(myWiFiManager->getConfigPortalSSID()));
@@ -196,7 +199,87 @@ void writeWAVHeaderPlaceholder(File &file) {
 
   file.write((uint8_t *)&header, sizeof(header));
 }
+void sendStatusToServer() {
+  if (WiFi.status() != WL_CONNECTED) return;
 
+  HTTPClient http;
+  http.begin("https://3125ccb2-54a5-4d27-9aef-532ef1bdaccc-00-226tm68i8l9bh.sisko.replit.dev/api/v1/esp32/status");  // Replace with your backend URL
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<200> doc;
+  doc["meetingId"] = MeetingId;
+  doc["meetingCount"] = meetingCount;
+  doc["recordingStatus"] = isRecording ? "recording" : "stopped";
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  int httpCode = http.POST(jsonString);
+
+  if (httpCode == 200) {
+    customPrint("Status updated on server");
+  } else {
+    customPrint("Failed to update status, HTTP code: " + String(httpCode));
+  }
+
+  http.end();
+}
+
+void pollCommandsFromServer() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;  // WiFi not connected, skip polling
+  }
+
+  HTTPClient http;
+  String url = String(cloudServer) + "/commands";
+  http.begin(url);
+
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+
+    // Parse JSON array of commands
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error) {
+      JsonArray arr = doc.as<JsonArray>();
+      for (JsonVariant cmdVar : arr) {
+        if (cmdVar.is<JsonObject>()) {
+          JsonObject obj = cmdVar.as<JsonObject>();
+          String cmd = obj["command"] | "";
+          String meetingIdFromCmd = obj["meetingId"] | "";
+
+          if (meetingIdFromCmd.length() > 0) {
+            MeetingId = meetingIdFromCmd;
+            customPrint("MeetingId set to: " + MeetingId);
+          }
+
+          if (cmd == "START_RECORDING") {
+            if (!isRecording) {
+              customPrint("Starting recording...");
+              startRecording();
+            }
+          } else if (cmd == "STOP_RECORDING") {
+            if (isRecording) {
+              customPrint("Stopping recording...");
+              stopRecording();
+            }
+          }
+          // handle other commands similarly...
+        } else if (cmdVar.is<const char *>()) {
+          // old style string commands, optional fallback
+          String cmd = cmdVar.as<const char *>();
+          // handle as before...
+        }
+      }
+    } else {
+      customPrint("JSON parse error in commands: " + String(error.c_str()));
+    }
+  } else {
+    customPrint("Failed to get commands. HTTP Code: " + String(httpCode));
+  }
+  http.end();
+}
 void updateWAVHeader(File &file, uint32_t totalAudioBytes) {
   uint32_t fileSize = 36 + totalAudioBytes;
   file.seek(4);
@@ -533,6 +616,11 @@ void setup() {
 void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     server.handleClient();
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastCommandPollTime >= commandPollInterval) {
+      lastCommandPollTime = currentMillis;
+      pollCommandsFromServer();
+    }
   }
 
   if (Serial.available()) {
