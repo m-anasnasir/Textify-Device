@@ -1,0 +1,590 @@
+#include <WiFi.h>
+#include <SPI.h>
+#include <SD.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <driver/i2s.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+
+// Create display object for SH1106 I2C (ESP32)
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// I2S and SD Configurations
+#define SD_CS_PIN 5
+#define SAMPLE_RATE 48000
+#define SAMPLE_BUFFER_SIZE 512
+#define CHUNK_DURATION_MS 10000  // 10 seconds
+
+// Global Variables
+bool isIntroRecording = false;
+File introFile;
+uint32_t introBytesWritten = 0;
+unsigned long introStartTime = 0;
+int introCount = 1;
+String currentIntroFilePath = "";
+String MeetingId = "";
+
+File audioFile;
+int16_t raw_samples[SAMPLE_BUFFER_SIZE];
+uint32_t totalBytesWritten = 0;
+int meetingCount = 1;
+bool isRecording = false;
+bool stopRequested = false;
+unsigned long chunkStartTime = 0;
+String currentFilePath = "";
+
+// OLED display buffer
+#define MAX_LINES 5
+#define MAX_CHARS_PER_LINE 21  // 128 pixels / ~6 pixels per char ≈ 21 chars
+String displayBuffer[MAX_LINES];
+int lineCount = 0;
+
+// Rate limiting for customPrint
+unsigned long lastPrintTime = 0;
+const unsigned long printInterval = 500; // Minimum 500ms between prints
+
+// WAV Header structure definition
+struct WAVHeader {
+  char riff[4];
+  uint32_t fileSize;
+  char wave[4];
+  char fmtChunkMarker[4];
+  uint32_t fmtChunkSize;
+  uint16_t audioFormat;
+  uint16_t numChannels;
+  uint32_t sampleRate;
+  uint32_t byteRate;
+  uint16_t blockAlign;
+  uint16_t bitsPerSample;
+  char dataChunkMarker[4];
+  uint32_t dataChunkSize;
+};
+
+WAVHeader header;
+
+// I2S configurations
+static const i2s_config_t i2s_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+  .sample_rate = SAMPLE_RATE,
+  .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+  .communication_format = I2S_COMM_FORMAT_I2S,
+  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+  .dma_buf_count = 4,
+  .dma_buf_len = 1024,
+  .use_apll = false,
+  .tx_desc_auto_clear = false,
+  .fixed_mclk = 0
+};
+
+static const i2s_pin_config_t i2s_mic_pins = {
+  .bck_io_num = GPIO_NUM_14,
+  .ws_io_num = GPIO_NUM_15,
+  .data_out_num = I2S_PIN_NO_CHANGE,
+  .data_in_num = GPIO_NUM_32
+};
+
+// Create WebServer object on port 80
+WebServer server(80);
+
+// Custom print function to mirror to OLED with rate limiting and cleaned-up display
+void customPrint(const String &message) {
+  unsigned long currentTime = millis();
+  if (currentTime - lastPrintTime < printInterval) {
+    return; // Skip printing if too soon
+  }
+  lastPrintTime = currentTime;
+
+  Serial.println(message);
+
+  // Truncate message to fit display width
+  String displayMessage = message;
+  if (displayMessage.length() > MAX_CHARS_PER_LINE) {
+    displayMessage = displayMessage.substring(0, MAX_CHARS_PER_LINE - 3) + "...";
+  }
+
+  // Update the display buffer (scrolling mechanism)
+  if (lineCount < MAX_LINES) {
+    displayBuffer[lineCount] = displayMessage;
+    lineCount++;
+  } else {
+    for (int i = 0; i < MAX_LINES - 1; i++) {
+      displayBuffer[i] = displayBuffer[i + 1];
+    }
+    displayBuffer[MAX_LINES - 1] = displayMessage;
+  }
+
+  // Clear the display buffer
+  u8g2.clearBuffer();
+
+  // Draw the header (WiFi status)
+  String wifiStatus = (WiFi.status() == WL_CONNECTED) ? "WiFi: Connected" : "WiFi: Disconnected";
+  if (wifiStatus.length() > MAX_CHARS_PER_LINE) {
+    wifiStatus = wifiStatus.substring(0, MAX_CHARS_PER_LINE - 3) + "...";
+  }
+  u8g2.drawStr(2, 12, wifiStatus.c_str()); // Header at y=12 (first line)
+
+  // Draw a separator line below the header
+  u8g2.drawHLine(0, 14, 128);
+
+  // Draw the message lines (starting below the header)
+  for (int i = 0; i < lineCount && i < MAX_LINES; i++) {
+    u8g2.drawStr(2, 26 + i * 10, displayBuffer[i].c_str()); // Messages at y=26, 36, 46, 56, 66
+  }
+
+  u8g2.sendBuffer();
+}
+
+// ===== Wi-Fi Setup with WiFiManager =====
+void connectWiFi() {
+  // Ensure Wi-Fi is off initially
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+
+  customPrint("Starting WiFi initialization...");
+  WiFi.mode(WIFI_STA);
+  delay(500);
+
+  customPrint("WiFi mode set to STA");
+
+  WiFiManager wifiManager;
+  wifiManager.setTimeout(180);
+  wifiManager.setDebugOutput(true); // Enable detailed debug output
+  wifiManager.setAPCallback([](WiFiManager *myWiFiManager) {
+    customPrint("Entered config mode");
+    customPrint("Connect to AP: " + String(myWiFiManager->getConfigPortalSSID()));
+    customPrint("IP: 192.168.4.1");
+  });
+
+  customPrint("Starting WiFiManager autoConnect...");
+  if (!wifiManager.autoConnect("Textify")) {
+    customPrint("❌ Failed to connect to WiFi and hit timeout");
+    // Instead of restarting, we'll disable Wi-Fi and continue
+    WiFi.mode(WIFI_OFF);
+    customPrint("WiFi disabled due to failure");
+    return;
+  }
+
+  customPrint("✅ Connected to WiFi");
+  customPrint("IP Address: " + WiFi.localIP().toString());
+  // Turn on built-in blue LED (GPIO 2)
+  pinMode(2, OUTPUT);
+  digitalWrite(2, HIGH);
+  // Turn on external LED (GPIO 4)
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
+}
+
+// ===== WAV File Header Functions =====
+void writeWAVHeaderPlaceholder(File &file) {
+  memcpy(header.riff, "RIFF", 4);
+  header.fileSize = 0;
+  memcpy(header.wave, "WAVE", 4);
+  memcpy(header.fmtChunkMarker, "fmt ", 4);
+  header.fmtChunkSize = 16;
+  header.audioFormat = 1;
+  header.numChannels = 1;
+  header.sampleRate = SAMPLE_RATE;
+  header.bitsPerSample = 16;
+  header.byteRate = SAMPLE_RATE * 2;
+  header.blockAlign = 2;
+  memcpy(header.dataChunkMarker, "data", 4);
+  header.dataChunkSize = 0;
+
+  file.write((uint8_t *)&header, sizeof(header));
+}
+
+void updateWAVHeader(File &file, uint32_t totalAudioBytes) {
+  uint32_t fileSize = 36 + totalAudioBytes;
+  file.seek(4);
+  file.write((uint8_t *)&fileSize, sizeof(fileSize));
+  file.seek(40);
+  file.write((uint8_t *)&totalAudioBytes, sizeof(totalAudioBytes));
+  file.seek(0, SeekEnd);
+}
+
+// ===== Intro Recording Functions =====
+void startIntroRecording() {
+  currentIntroFilePath = "/intro/intro" + String(introCount) + ".wav";
+
+  introFile = SD.open(currentIntroFilePath, FILE_WRITE);
+  if (!introFile) {
+    customPrint("❌ Failed to open intro file for recording");
+    return;
+  }
+
+  writeWAVHeaderPlaceholder(introFile);
+  introBytesWritten = 0;
+  introStartTime = millis();
+  isIntroRecording = true;
+  customPrint("🎙 Intro recording started: " + currentIntroFilePath);
+}
+
+void stopIntroRecording() {
+  if (!isIntroRecording) {
+    customPrint("❌ No intro recording in progress");
+    return;
+  }
+
+  updateWAVHeader(introFile, introBytesWritten);
+  introFile.close();
+  isIntroRecording = false;
+  customPrint("📁 Intro recording stopped");
+
+  // Skip upload if WiFi is not connected
+  if (WiFi.status() != WL_CONNECTED) {
+    customPrint("❌ WiFi not connected, skipping intro upload");
+    introCount++;
+    return;
+  }
+
+  String filename = "intro_audio/intro" + String(introCount) + ".wav";
+  String requestURL = "https://3125ccb2-54a5-4d27-9aef-532ef1bdaccc-00-226tm68i8l9bh.sisko.replit.dev/api/v1/presigned-url?filename=" + filename;
+
+  HTTPClient http;
+  http.begin(requestURL);
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    customPrint("❌ Failed to get pre-signed URL for intro. HTTP Code: " + String(httpCode));
+    if (httpCode > 0) {
+      String payload = http.getString();
+      customPrint("Server Response: " + payload);
+    }
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    customPrint(String("❌ JSON parse failed for intro: ") + error.c_str());
+    return;
+  }
+
+  if (!doc.containsKey("url")) {
+    customPrint("❌ 'url' field missing in intro response");
+    return;
+  }
+
+  String presignedUrl = doc["url"].as<String>();
+  if (presignedUrl.length() == 0) {
+    customPrint("❌ Empty intro presigned URL");
+    return;
+  }
+
+  uploadToS3(currentIntroFilePath, presignedUrl);
+  introCount++;
+}
+
+// ===== S3 Upload Logic =====
+void uploadToS3(String filePath, String presignedURL) {
+  File file = SD.open(filePath);
+  if (!file) {
+    customPrint("❌ Failed to open file for upload: " + filePath);
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(presignedURL);
+  http.addHeader("Content-Type", "audio/wav");
+
+  int response = http.sendRequest("PUT", &file, file.size());
+  customPrint("📤 Upload HTTP Code: " + String(response));
+
+  http.end();
+  file.close();
+}
+
+void startRecording() {
+  if (MeetingId.length() == 0) {
+    customPrint("❌ Cannot start recording - MeetingId not set!");
+    return;
+  }
+
+  String folderPath = "/" + MeetingId + "/audio";
+
+  if (!SD.exists(folderPath)) {
+    if (SD.mkdir(folderPath)) {
+      customPrint("📂 Created folder: " + folderPath);
+    } else {
+      customPrint("❌ Failed to create folder: " + folderPath);
+      return;
+    }
+  }
+
+  currentFilePath = folderPath + "/meeting" + String(meetingCount) + ".wav";
+
+  audioFile = SD.open(currentFilePath, FILE_WRITE);
+  if (!audioFile) {
+    customPrint("❌ Failed to open file for recording: " + currentFilePath);
+    return;
+  }
+
+  writeWAVHeaderPlaceholder(audioFile);
+  totalBytesWritten = 0;
+  chunkStartTime = millis();
+  isRecording = true;
+  customPrint("🎙 Recording started: " + currentFilePath);
+}
+
+void stopRecording() {
+  if (!isRecording) {
+    customPrint("❌ Not recording");
+    return;
+  }
+
+  updateWAVHeader(audioFile, totalBytesWritten);
+  audioFile.close();
+  isRecording = false;
+  customPrint("📁 Recording stopped");
+
+  // Skip upload if WiFi is not connected
+  if (WiFi.status() != WL_CONNECTED) {
+    customPrint("❌ WiFi not connected, skipping upload");
+    meetingCount++;
+    return;
+  }
+
+  String filename = MeetingId + "/audio/" + "meeting" + String(meetingCount) + ".wav";
+  String requestURL = "https://3125ccb2-54a5-4d27-9aef-532ef1bdaccc-00-226tm68i8l9bh.sisko.replit.dev/api/v1/presigned-url?filename=" + filename;
+  customPrint("Opening file at path: " + currentFilePath);
+
+  File testFile = SD.open(currentFilePath);
+  if (!testFile) {
+    customPrint("❌ Test open failed! File does not exist or cannot be opened.");
+  } else {
+    customPrint("✅ Test open succeeded.");
+    testFile.close();
+  }
+  customPrint("Uploading file with filename: " + filename);
+
+  HTTPClient http;
+  http.begin(requestURL);
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    customPrint("❌ Failed to get pre-signed URL. HTTP Code: " + String(httpCode));
+    if (httpCode > 0) {
+      String payload = http.getString();
+      customPrint("Server Response: " + payload);
+    }
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    customPrint(String("❌ JSON parse failed: ") + error.c_str());
+    return;
+  }
+
+  if (!doc.containsKey("url")) {
+    customPrint("❌ 'url' field missing in response");
+    return;
+  }
+
+  String presignedUrl = doc["url"].as<String>();
+  if (presignedUrl.length() == 0) {
+    customPrint("❌ Empty presigned URL");
+    return;
+  }
+  String localFilePath = "/" + filename;
+  uploadToS3(localFilePath, presignedUrl);
+  meetingCount++;
+}
+
+// ===== Setup =====
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Initialize OLED
+  Wire.begin(21, 22);
+  u8g2.begin();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.setContrast(128);
+
+  customPrint("Initializing...");
+
+  if (!SD.begin(SD_CS_PIN)) {
+    customPrint("❌ SD card initialization failed!");
+    while (true) delay(100);
+  }
+  customPrint("✅ SD card initialized");
+  if (!SD.exists("/intro")) {
+    SD.mkdir("/intro");
+    customPrint("📂 '/intro' folder created");
+  } else {
+    customPrint("📂 '/intro' folder already exists");
+  }
+  if (!SD.exists("/audio")) {
+    SD.mkdir("/audio");
+    customPrint("📂 '/audio' folder created");
+  } else {
+    customPrint("📂 '/audio' folder created");
+  }
+
+  // Check GPIO 2 state
+  pinMode(2, INPUT);
+  int gpio2State = digitalRead(2);
+  customPrint("GPIO 2 state: " + String(gpio2State));
+
+  connectWiFi();
+
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
+  customPrint("✅ I2S initialized");
+
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/plain", "ESP32 Audio Recorder API");
+  });
+
+  server.on("/start", HTTP_GET, []() {
+    if (!isRecording) {
+      MeetingId = server.arg("meetingId");
+      customPrint("Received MeetingId: " + MeetingId);
+
+      if (MeetingId.length() == 0) {
+        server.send(400, "application/json", "{\"error\":\"meetingId parameter is required\"}");
+        return;
+      }
+
+      String meetingFolder = "/" + MeetingId;
+      if (!SD.exists(meetingFolder)) {
+        SD.mkdir(meetingFolder);
+        customPrint("Created meeting folder: " + meetingFolder);
+      }
+
+      String audioFolder = meetingFolder + "/audio";
+      if (!SD.exists(audioFolder)) {
+        SD.mkdir(audioFolder);
+        customPrint("Created audio folder: " + audioFolder);
+      }
+
+      currentFilePath = audioFolder + "/meeting" + String(meetingCount) + ".wav";
+      customPrint("Recording to: " + currentFilePath);
+
+      stopRequested = false;
+      startRecording();
+      server.send(200, "application/json", "{\"status\":\"started\",\"path\":\"" + currentFilePath + "\"}");
+    } else {
+      server.send(200, "application/json", "{\"status\":\"already_recording\"}");
+    }
+  });
+
+  server.on("/stop", HTTP_GET, []() {
+    if (isRecording) {
+      stopRecording();
+
+      String response = "{\"status\":\"stopped\"" + String(",\"meetingId\":\"") + MeetingId + "\"" + ",\"meetingCount\":" + String(meetingCount) + ",\"filePath\":\"" + currentFilePath + "\"" + ",\"message\":\"Recording saved and upload initiated\"}";
+
+      server.send(200, "application/json", response);
+    } else {
+      server.send(200, "application/json", "{\"status\":\"not_recording\"}");
+    }
+  });
+
+  server.on("/status", HTTP_GET, []() {
+    String status = isRecording ? "recording" : "stopped";
+    String response = "{\"status\":\"" + status + "\",\"meetingCount\":" + String(meetingCount) + ",\"meetingId\":\"" + MeetingId + "\"" + ",\"currentFile\":\"" + currentFilePath + "\"}";
+
+    server.send(200, "application/json", response);
+  });
+
+  server.on("/start-intro", HTTP_GET, []() {
+    if (!isIntroRecording) {
+      startIntroRecording();
+      server.send(200, "application/json", "{\"status\":\"intro_started\"}");
+    } else {
+      server.send(200, "application/json", "{\"status\":\"intro_already_recording\"}");
+    }
+  });
+
+  server.on("/stop-intro", HTTP_GET, []() {
+    if (isIntroRecording) {
+      stopIntroRecording();
+      server.send(200, "application/json", "{\"status\":\"intro_stopped\"}");
+    } else {
+      server.send(200, "application/json", "{\"status\":\"no_intro_recording\"}");
+    }
+  });
+
+  // Only start the server if WiFi is connected
+  if (WiFi.status() == WL_CONNECTED) {
+    server.begin();
+    customPrint("HTTP server started");
+  } else {
+    customPrint("HTTP server not started (no WiFi)");
+  }
+}
+
+// ===== Loop =====
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+  }
+
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    switch (cmd) {
+      case 's':
+        if (!isRecording) {
+          startRecording();
+        }
+        break;
+      case 'p':
+        if (isRecording) {
+          stopRecording();
+        }
+        break;
+      case 'r':
+        meetingCount = 1;
+        customPrint("✅ Meeting count reset to 1");
+        break;
+    }
+  }
+
+  if (isRecording) {
+    size_t bytes_read = 0;
+    i2s_read(I2S_NUM_0, raw_samples, sizeof(raw_samples), &bytes_read, portMAX_DELAY);
+    if (bytes_read > 0) {
+      audioFile.write((uint8_t *)raw_samples, bytes_read);
+      totalBytesWritten += bytes_read;
+    }
+
+    if (millis() - chunkStartTime >= CHUNK_DURATION_MS) {
+      customPrint("Chunk duration reached, stopping recording...");
+      stopRecording();
+      delay(2000);
+      if (!stopRequested) {
+        customPrint("Restarting recording...");
+        startRecording();
+      } else {
+        stopRequested = false;
+        customPrint("🛑 Recording stopped after final chunk.");
+      }
+    }
+  }
+
+  if (isIntroRecording) {
+    size_t bytes_read = 0;
+    i2s_read(I2S_NUM_0, raw_samples, sizeof(raw_samples), &bytes_read, portMAX_DELAY);
+    if (bytes_read > 0) {
+      introFile.write((uint8_t *)raw_samples, bytes_read);
+      introBytesWritten += bytes_read;
+    }
+  }
+
+  delay(1);
+}
